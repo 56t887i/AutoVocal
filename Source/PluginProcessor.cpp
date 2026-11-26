@@ -724,6 +724,15 @@ void AutoVocalAudioProcessor::applyProfile(
     setParameter("retuneSpeed", profile.retuneSpeed);
     setParameter("humanize", profile.humanize);
 
+    // Fast, assertive tuning for Aggressive and Club presets.
+    setParameter(
+        "tuneMode",
+        (mood == static_cast<int>(AutoVocal::Mood::Aggressive)
+         || mood == static_cast<int>(AutoVocal::Mood::Club))
+            ? 1.0f
+            : 0.0f
+    );
+
     if (auto* parameter = parameters.getParameter("tuneEnabled"))
     {
         parameter->setValueNotifyingHost(
