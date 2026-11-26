@@ -40,12 +40,12 @@ void PitchCorrector::prepare(
     currentSampleRate = juce::jmax(8000.0, sampleRate);
     channelCount = juce::jlimit(1, 2, channels);
 
-    latencySamples = static_cast<int>(currentSampleRate * 0.030);
-    minimumDelay = static_cast<int>(currentSampleRate * 0.012);
-    maximumDelay = static_cast<int>(currentSampleRate * 0.050);
+    latencySamples = static_cast<int>(currentSampleRate * 0.060);
+    minimumDelay = static_cast<int>(currentSampleRate * 0.040);
+    maximumDelay = static_cast<int>(currentSampleRate * 0.080);
 
     const int bufferSize =
-        static_cast<int>(currentSampleRate * 0.080) + 8;
+        static_cast<int>(currentSampleRate * 0.110) + 8;
 
     delayBuffers.clear();
     delayBuffers.resize(static_cast<size_t>(channelCount));
@@ -105,61 +105,132 @@ float PitchCorrector::detectPitch()
         static_cast<int>(analysisRate / 65.0f)
     );
 
-    std::array<float, analysisWindow / 2 + 1> correlations {};
-    float bestCorrelation = 0.0f;
-    int bestLag = 0;
+    // YIN-style difference analysis is less likely than a raw
+    // correlation maximum to lock onto a strong second harmonic.
+    // Use the same recent window for every candidate period.
+    const int comparisonSamples =
+        analysisWindow - maximumLag;
+
+    std::array<float, analysisWindow / 2 + 1> difference {};
+    std::array<float, analysisWindow / 2 + 1> cumulativeDifference {};
+
+    double mean = 0.0;
+
+    for (int i = 0; i < analysisWindow; ++i)
+    {
+        int position = analysisWritePosition - 1 - i;
+
+        while (position < 0)
+            position += analysisSize;
+
+        mean += analysisBuffer[static_cast<size_t>(position)];
+    }
+
+    mean /= static_cast<double>(analysisWindow);
 
     for (int lag = minimumLag; lag <= maximumLag; ++lag)
     {
-        double crossCorrelation = 0.0;
-        double energyA = 0.0;
-        double energyB = 0.0;
+        double sum = 0.0;
 
-        for (int i = 0; i < analysisWindow; ++i)
+        for (int i = 0; i < comparisonSamples; ++i)
         {
             int positionA = analysisWritePosition - 1 - i;
+            int positionB = positionA - lag;
+
             while (positionA < 0)
                 positionA += analysisSize;
 
-            int positionB = positionA - lag;
             while (positionB < 0)
                 positionB += analysisSize;
 
-            const float a = analysisBuffer[static_cast<size_t>(positionA)];
-            const float b = analysisBuffer[static_cast<size_t>(positionB)];
+            const float a =
+                analysisBuffer[static_cast<size_t>(positionA)]
+                - static_cast<float>(mean);
 
-            crossCorrelation += static_cast<double>(a) * b;
-            energyA += static_cast<double>(a) * a;
-            energyB += static_cast<double>(b) * b;
+            const float b =
+                analysisBuffer[static_cast<size_t>(positionB)]
+                - static_cast<float>(mean);
+
+            const float delta = a - b;
+            sum += static_cast<double>(delta) * delta;
         }
 
-        const double denominator =
-            std::sqrt(energyA * energyB) + 1.0e-12;
+        difference[static_cast<size_t>(lag)] =
+            static_cast<float>(sum);
+    }
 
-        const float correlation =
-            static_cast<float>(crossCorrelation / denominator);
+    double runningDifference = 0.0;
 
-        correlations[static_cast<size_t>(lag)] = correlation;
+    for (int lag = minimumLag; lag <= maximumLag; ++lag)
+    {
+        runningDifference += difference[static_cast<size_t>(lag)];
 
-        if (correlation > bestCorrelation)
+        const float normalised =
+            runningDifference > 1.0e-12
+                ? difference[static_cast<size_t>(lag)]
+                    * static_cast<float>(lag)
+                    / static_cast<float>(runningDifference)
+                : 1.0f;
+
+        cumulativeDifference[static_cast<size_t>(lag)] = normalised;
+    }
+
+    constexpr float yinThreshold = 0.16f;
+    int bestLag = 0;
+
+    // Choose the first credible dip, not simply the deepest dip.
+    // This favours the fundamental over its octave-related multiples.
+    for (int lag = minimumLag + 1; lag < maximumLag; ++lag)
+    {
+        const float value =
+            cumulativeDifference[static_cast<size_t>(lag)];
+
+        if (value < yinThreshold
+            && value <= cumulativeDifference[static_cast<size_t>(lag - 1)]
+            && value <= cumulativeDifference[static_cast<size_t>(lag + 1)])
         {
-            bestCorrelation = correlation;
             bestLag = lag;
+            break;
         }
     }
 
-    if (bestLag <= 0 || bestCorrelation < 0.60f)
+    if (bestLag == 0)
+    {
+        float bestValue = 1.0f;
+
+        for (int lag = minimumLag; lag <= maximumLag; ++lag)
+        {
+            const float value =
+                cumulativeDifference[static_cast<size_t>(lag)];
+
+            if (value < bestValue)
+            {
+                bestValue = value;
+                bestLag = lag;
+            }
+        }
+
+        if (bestValue > 0.32f)
+            return 0.0f;
+    }
+
+    if (bestLag <= 0)
         return 0.0f;
 
-    // Parabolic peak interpolation gives sub-sample period estimates,
-    // reducing the stepped tuning movement caused by integer lags.
+    // Sub-sample interpolation reduces pitch flutter between adjacent lags.
     float refinedLag = static_cast<float>(bestLag);
 
     if (bestLag > minimumLag && bestLag < maximumLag)
     {
-        const float left = correlations[static_cast<size_t>(bestLag - 1)];
-        const float centre = correlations[static_cast<size_t>(bestLag)];
-        const float right = correlations[static_cast<size_t>(bestLag + 1)];
+        const float left =
+            cumulativeDifference[static_cast<size_t>(bestLag - 1)];
+
+        const float centre =
+            cumulativeDifference[static_cast<size_t>(bestLag)];
+
+        const float right =
+            cumulativeDifference[static_cast<size_t>(bestLag + 1)];
+
         const float curvature = left - 2.0f * centre + right;
 
         if (std::abs(curvature) > 1.0e-8f)
@@ -173,8 +244,12 @@ float PitchCorrector::detectPitch()
 
     const float frequency = analysisRate / refinedLag;
 
-    if (frequency < 65.0f || frequency > 1000.0f)
+    if (!std::isfinite(frequency)
+        || frequency < 65.0f
+        || frequency > 1000.0f)
+    {
         return 0.0f;
+    }
 
     return frequency;
 }
