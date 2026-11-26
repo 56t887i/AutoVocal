@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include <JuceHeader.h>
@@ -23,9 +22,15 @@ public:
 private:
     double sampleRate = 44100.0;
 
-    float envelope = 0.0f;
+    // Peak and RMS detectors are linked across the stereo pair.
+    float peakEnvelope = 0.0f;
+    float rmsEnvelopeSquared = 0.0f;
+
     float currentGain = 1.0f;
+    float currentMix = 0.0f;
 
     float attackCoefficient = 0.0f;
     float releaseCoefficient = 0.0f;
+    float rmsCoefficient = 0.0f;
+    float mixCoefficient = 0.0f;
 };

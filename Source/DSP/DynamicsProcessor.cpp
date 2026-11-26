@@ -1,5 +1,6 @@
-
 #include "DynamicsProcessor.h"
+
+#include <cmath>
 
 void DynamicsProcessor::prepare(
     double newSampleRate,
@@ -12,10 +13,15 @@ void DynamicsProcessor::prepare(
 
 void DynamicsProcessor::reset()
 {
-    envelope = 0.0f;
+    peakEnvelope = 0.0f;
+    rmsEnvelopeSquared = 0.0f;
     currentGain = 1.0f;
+    currentMix = 0.0f;
+
     attackCoefficient = 0.0f;
     releaseCoefficient = 0.0f;
+    rmsCoefficient = 0.0f;
+    mixCoefficient = 0.0f;
 }
 
 void DynamicsProcessor::process(
@@ -28,9 +34,6 @@ void DynamicsProcessor::process(
     float makeup,
     float mix)
 {
-    if (!enabled)
-        return;
-
     threshold = juce::jlimit(-60.0f, 0.0f, threshold);
     ratio = juce::jlimit(1.0f, 20.0f, ratio);
     attack = juce::jlimit(0.1f, 200.0f, attack);
@@ -38,80 +41,98 @@ void DynamicsProcessor::process(
     makeup = juce::jlimit(0.0f, 18.0f, makeup);
     mix = juce::jlimit(0.0f, 1.0f, mix);
 
+    const float rate = static_cast<float>(sampleRate);
     const float attackSeconds = attack * 0.001f;
     const float releaseSeconds = release * 0.001f;
 
-    attackCoefficient = std::exp(
-        -1.0f /
-        (static_cast<float>(sampleRate) * attackSeconds)
-    );
+    attackCoefficient = std::exp(-1.0f / (rate * attackSeconds));
+    releaseCoefficient = std::exp(-1.0f / (rate * releaseSeconds));
 
-    releaseCoefficient = std::exp(
-        -1.0f /
-        (static_cast<float>(sampleRate) * releaseSeconds)
-    );
+    // A 10 ms RMS window steadies the detector across voiced syllables,
+    // while the peak path keeps consonants and fast transients controlled.
+    rmsCoefficient = std::exp(-1.0f / (rate * 0.010f));
 
-    const float makeupGain =
-        juce::Decibels::decibelsToGain(makeup);
+    // Smooth bypass and wet/dry automation to prevent abrupt gain jumps.
+    mixCoefficient = std::exp(-1.0f / (rate * 0.010f));
+
+    const float targetMix = enabled ? mix : 0.0f;
+    const float makeupGain = juce::Decibels::decibelsToGain(makeup);
 
     const int channels = buffer.getNumChannels();
     const int samples = buffer.getNumSamples();
 
+    if (channels <= 0 || samples <= 0)
+        return;
+
     for (int i = 0; i < samples; ++i)
     {
-        // Linked stereo peak detector.
         float peak = 0.0f;
+        float meanSquare = 0.0f;
 
+        // Linked detection prevents the stereo image from moving when
+        // one side of a stereo vocal/effect is louder than the other.
         for (int channel = 0; channel < channels; ++channel)
         {
-            peak = juce::jmax(
-                peak,
-                std::abs(buffer.getSample(channel, i))
-            );
+            const float value = buffer.getSample(channel, i);
+            peak = juce::jmax(peak, std::abs(value));
+            meanSquare += value * value;
         }
 
-        // Envelope follower.
-        const float envelopeCoefficient =
-            peak > envelope
-                ? attackCoefficient
-                : releaseCoefficient;
+        meanSquare /= static_cast<float>(channels);
 
-        envelope =
-            envelopeCoefficient * envelope
-            + (1.0f - envelopeCoefficient) * peak;
+        const float peakCoefficient =
+            peak > peakEnvelope ? attackCoefficient : releaseCoefficient;
 
-        const float envelopeDb =
-            juce::Decibels::gainToDecibels(
-                envelope + 0.000001f
-            );
+        peakEnvelope =
+            peakCoefficient * peakEnvelope
+            + (1.0f - peakCoefficient) * peak;
 
-        // Smooth 6 dB soft knee avoids an abrupt change in tone
-        // when vocal syllables cross the compression threshold.
-        constexpr float kneeWidthDb = 6.0f;
-        const float halfKnee = kneeWidthDb * 0.5f;
+        rmsEnvelopeSquared =
+            rmsCoefficient * rmsEnvelopeSquared
+            + (1.0f - rmsCoefficient) * meanSquare;
+
+        const float rmsLevel = std::sqrt(
+            juce::jmax(0.0f, rmsEnvelopeSquared)
+        );
+
+        // Peak-forward hybrid detection keeps punch without letting every
+        // tiny consonant spike dictate the entire gain envelope.
+        const float detectorLevel =
+            0.70f * peakEnvelope + 0.30f * rmsLevel;
+
         float targetGainDb = 0.0f;
 
-        if (envelopeDb > threshold + halfKnee)
+        if (enabled)
         {
-            targetGainDb =
-                (threshold + (envelopeDb - threshold) / ratio)
-                - envelopeDb;
-        }
-        else if (envelopeDb > threshold - halfKnee)
-        {
-            const float kneePosition =
-                envelopeDb - threshold + halfKnee;
+            const float detectorDb =
+                juce::Decibels::gainToDecibels(
+                    detectorLevel + 0.000001f
+                );
 
-            targetGainDb =
-                (1.0f / ratio - 1.0f)
-                * kneePosition * kneePosition
-                / (2.0f * kneeWidthDb);
+            constexpr float kneeWidthDb = 6.0f;
+            constexpr float halfKneeDb = kneeWidthDb * 0.5f;
+
+            if (detectorDb > threshold + halfKneeDb)
+            {
+                targetGainDb =
+                    threshold + (detectorDb - threshold) / ratio
+                    - detectorDb;
+            }
+            else if (detectorDb > threshold - halfKneeDb)
+            {
+                const float kneePosition =
+                    detectorDb - threshold + halfKneeDb;
+
+                targetGainDb =
+                    (1.0f / ratio - 1.0f)
+                    * kneePosition * kneePosition
+                    / (2.0f * kneeWidthDb);
+            }
         }
 
         const float targetGain =
             juce::Decibels::decibelsToGain(targetGainDb);
 
-        // Smooth gain reduction and recovery separately.
         const float gainCoefficient =
             targetGain < currentGain
                 ? attackCoefficient
@@ -120,6 +141,10 @@ void DynamicsProcessor::process(
         currentGain =
             gainCoefficient * currentGain
             + (1.0f - gainCoefficient) * targetGain;
+
+        currentMix =
+            mixCoefficient * currentMix
+            + (1.0f - mixCoefficient) * targetMix;
 
         const float wetGain = currentGain * makeupGain;
 
@@ -131,7 +156,7 @@ void DynamicsProcessor::process(
             buffer.setSample(
                 channel,
                 i,
-                dry + (wet - dry) * mix
+                dry + (wet - dry) * currentMix
             );
         }
     }
