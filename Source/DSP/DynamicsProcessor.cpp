@@ -85,16 +85,27 @@ void DynamicsProcessor::process(
                 envelope + 0.000001f
             );
 
-        // Calculate compression gain.
+        // Smooth 6 dB soft knee avoids an abrupt change in tone
+        // when vocal syllables cross the compression threshold.
+        constexpr float kneeWidthDb = 6.0f;
+        const float halfKnee = kneeWidthDb * 0.5f;
         float targetGainDb = 0.0f;
 
-        if (envelopeDb > threshold)
+        if (envelopeDb > threshold + halfKnee)
         {
-            const float compressedDb =
-                threshold
-                + (envelopeDb - threshold) / ratio;
+            targetGainDb =
+                (threshold + (envelopeDb - threshold) / ratio)
+                - envelopeDb;
+        }
+        else if (envelopeDb > threshold - halfKnee)
+        {
+            const float kneePosition =
+                envelopeDb - threshold + halfKnee;
 
-            targetGainDb = compressedDb - envelopeDb;
+            targetGainDb =
+                (1.0f / ratio - 1.0f)
+                * kneePosition * kneePosition
+                / (2.0f * kneeWidthDb);
         }
 
         const float targetGain =
