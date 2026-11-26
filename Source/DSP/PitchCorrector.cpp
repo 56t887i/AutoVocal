@@ -343,13 +343,29 @@ float PitchCorrector::readDelayLine(
     while (readPosition >= static_cast<float>(size))
         readPosition -= static_cast<float>(size);
 
-    const int indexA = static_cast<int>(readPosition);
-    const int indexB = (indexA + 1) % size;
-    const float fraction = readPosition - static_cast<float>(indexA);
+    const int index1 = static_cast<int>(readPosition);
+    const int index0 = (index1 + size - 1) % size;
+    const int index2 = (index1 + 1) % size;
+    const int index3 = (index1 + 2) % size;
+    const float fraction = readPosition - static_cast<float>(index1);
 
-    return data[static_cast<size_t>(indexA)]
-        + (data[static_cast<size_t>(indexB)]
-           - data[static_cast<size_t>(indexA)]) * fraction;
+    // Cubic interpolation preserves more high-frequency detail than
+    // linear interpolation when the two moving delay heads resample
+    // the vocal. The circular indices keep all four taps in bounds.
+    const float y0 = data[static_cast<size_t>(index0)];
+    const float y1 = data[static_cast<size_t>(index1)];
+    const float y2 = data[static_cast<size_t>(index2)];
+    const float y3 = data[static_cast<size_t>(index3)];
+
+    const float t2 = fraction * fraction;
+    const float t3 = t2 * fraction;
+
+    return 0.5f * (
+        2.0f * y1
+        + (-y0 + y2) * fraction
+        + (2.0f * y0 - 5.0f * y1 + 4.0f * y2 - y3) * t2
+        + (-y0 + 3.0f * y1 - 3.0f * y2 + y3) * t3
+    );
 }
 
 void PitchCorrector::process(
