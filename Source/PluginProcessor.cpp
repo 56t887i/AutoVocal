@@ -718,6 +718,19 @@ void AutoVocalAudioProcessor::applyProfile(
         }
     };
 
+    // Pitch correction.
+    // These profile settings existed but were never applied.
+    setParameter("tuneAmount", profile.tuneAmount * 100.0f);
+    setParameter("retuneSpeed", profile.retuneSpeed);
+    setParameter("humanize", profile.humanize);
+
+    if (auto* parameter = parameters.getParameter("tuneEnabled"))
+    {
+        parameter->setValueNotifyingHost(
+            profile.tuneAmount > 0.001f ? 1.0f : 0.0f
+        );
+    }
+
     // Character.
     setParameter("drive", profile.drive);
     setParameter("saturation", profile.saturation);

@@ -76,7 +76,7 @@ private:
     std::atomic<float> noiseLearnProgress { 0.0f };
     std::atomic<bool> noiseProfileReady { false };
 
-    int currentNoiseMode = -1;
+    std::atomic<int> currentNoiseMode { -1 };
 
     double currentSampleRate = 44100.0;
 
