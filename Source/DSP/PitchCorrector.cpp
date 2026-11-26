@@ -2,14 +2,22 @@
 
 #include <cmath>
 #include <algorithm>
+#include <array>
 
 namespace
 {
     constexpr float pi = 3.14159265358979323846f;
-    constexpr int analysisSize = 2048;
-    constexpr int analysisDownsample = 4;
-    constexpr int analysisWindow = 512;
-    constexpr int analysisHop = 256;
+
+    // 15-tap Blackman-windowed low-pass FIR, cutoff ~= 0.105 cycles/sample.
+    // The cutoff is below the new Nyquist limit after 4:1 decimation.
+    constexpr std::array<float, 15> analysisFir
+    {{
+         0.0f, -0.0008394524f, -0.0010081886f,
+         0.0101542522f, 0.0500432395f, 0.1231756670f,
+         0.2009594300f, 0.2350301050f, 0.2009594300f,
+         0.1231756670f, 0.0500432395f, 0.0101542522f,
+        -0.0010081886f, -0.0008394524f, 0.0f
+    }};
 
     float midiToFrequency(float midi)
     {
@@ -55,13 +63,12 @@ void PitchCorrector::reset()
     for (auto& channel : delayBuffers)
         std::fill(channel.begin(), channel.end(), 0.0f);
 
-    std::fill(
-        analysisBuffer.begin(),
-        analysisBuffer.end(),
-        0.0f
-    );
+    std::fill(analysisBuffer.begin(), analysisBuffer.end(), 0.0f);
+    analysisFirHistory.fill(0.0f);
 
     writePosition = 0;
+    analysisFirWritePosition = 0;
+    decimationCounter = 0;
     analysisWritePosition = 0;
     samplesSinceAnalysis = 0;
 
@@ -83,22 +90,20 @@ float PitchCorrector::detectPitch()
     if (analysisBuffer.size() < analysisSize)
         return 0.0f;
 
+    const float analysisRate =
+        static_cast<float>(currentSampleRate / decimationFactor);
+
     const int minimumLag = juce::jmax(
         2,
-        static_cast<int>(
-            currentSampleRate / 1000.0
-            / analysisDownsample
-        )
+        static_cast<int>(analysisRate / 1000.0f)
     );
 
     const int maximumLag = juce::jmin(
         analysisWindow / 2,
-        static_cast<int>(
-            currentSampleRate / 65.0
-            / analysisDownsample
-        )
+        static_cast<int>(analysisRate / 65.0f)
     );
 
+    std::array<float, analysisWindow / 2 + 1> correlations {};
     float bestCorrelation = 0.0f;
     int bestLag = 0;
 
@@ -110,21 +115,16 @@ float PitchCorrector::detectPitch()
 
         for (int i = 0; i < analysisWindow; ++i)
         {
-            const int positionA =
-                (analysisWritePosition
-                 - 1
-                 - i * analysisDownsample
-                 + analysisSize * 2)
-                % analysisSize;
+            int positionA = analysisWritePosition - 1 - i;
+            while (positionA < 0)
+                positionA += analysisSize;
 
-            const int positionB =
-                (positionA
-                 - lag * analysisDownsample
-                 + analysisSize)
-                % analysisSize;
+            int positionB = positionA - lag;
+            while (positionB < 0)
+                positionB += analysisSize;
 
-            const float a = analysisBuffer[positionA];
-            const float b = analysisBuffer[positionB];
+            const float a = analysisBuffer[static_cast<size_t>(positionA)];
+            const float b = analysisBuffer[static_cast<size_t>(positionB)];
 
             crossCorrelation += static_cast<double>(a) * b;
             energyA += static_cast<double>(a) * a;
@@ -137,6 +137,8 @@ float PitchCorrector::detectPitch()
         const float correlation =
             static_cast<float>(crossCorrelation / denominator);
 
+        correlations[static_cast<size_t>(lag)] = correlation;
+
         if (correlation > bestCorrelation)
         {
             bestCorrelation = correlation;
@@ -147,11 +149,27 @@ float PitchCorrector::detectPitch()
     if (bestLag <= 0 || bestCorrelation < 0.60f)
         return 0.0f;
 
-    const float frequency =
-        static_cast<float>(
-            currentSampleRate
-            / (bestLag * analysisDownsample)
-        );
+    // Parabolic peak interpolation gives sub-sample period estimates,
+    // reducing the stepped tuning movement caused by integer lags.
+    float refinedLag = static_cast<float>(bestLag);
+
+    if (bestLag > minimumLag && bestLag < maximumLag)
+    {
+        const float left = correlations[static_cast<size_t>(bestLag - 1)];
+        const float centre = correlations[static_cast<size_t>(bestLag)];
+        const float right = correlations[static_cast<size_t>(bestLag + 1)];
+        const float curvature = left - 2.0f * centre + right;
+
+        if (std::abs(curvature) > 1.0e-8f)
+        {
+            const float offset =
+                0.5f * (left - right) / curvature;
+
+            refinedLag += juce::jlimit(-0.5f, 0.5f, offset);
+        }
+    }
+
+    const float frequency = analysisRate / refinedLag;
 
     if (frequency < 65.0f || frequency > 1000.0f)
         return 0.0f;
@@ -177,9 +195,7 @@ int PitchCorrector::findTargetNote(
     key = juce::jlimit(0, 11, key);
     scale = juce::jlimit(0, 2, scale);
 
-    const int nearestMidi = static_cast<int>(
-        std::round(midiNote)
-    );
+    const int nearestMidi = static_cast<int>(std::round(midiNote));
 
     if (scale == 0)
         return nearestMidi;
@@ -187,26 +203,20 @@ int PitchCorrector::findTargetNote(
     int bestNote = nearestMidi;
     float smallestDistance = 1000.0f;
 
-    for (int note = nearestMidi - 12;
-         note <= nearestMidi + 12;
-         ++note)
+    for (int note = nearestMidi - 12; note <= nearestMidi + 12; ++note)
     {
         int pitchClass = note % 12;
 
         if (pitchClass < 0)
             pitchClass += 12;
 
-        const int relativePitch =
-            (pitchClass - key + 12) % 12;
-
+        const int relativePitch = (pitchClass - key + 12) % 12;
         bool allowed = false;
 
         for (int i = 0; i < 7; ++i)
         {
             const int scaleNote =
-                scale == 1
-                    ? majorScale[i]
-                    : minorScale[i];
+                scale == 1 ? majorScale[i] : minorScale[i];
 
             if (relativePitch == scaleNote)
             {
@@ -246,8 +256,7 @@ float PitchCorrector::readDelayLine(
         delay
     );
 
-    float readPosition =
-        static_cast<float>(writePosition) - delay;
+    float readPosition = static_cast<float>(writePosition) - delay;
 
     while (readPosition < 0.0f)
         readPosition += static_cast<float>(size);
@@ -255,17 +264,13 @@ float PitchCorrector::readDelayLine(
     while (readPosition >= static_cast<float>(size))
         readPosition -= static_cast<float>(size);
 
-    const int indexA =
-        static_cast<int>(readPosition);
+    const int indexA = static_cast<int>(readPosition);
+    const int indexB = (indexA + 1) % size;
+    const float fraction = readPosition - static_cast<float>(indexA);
 
-    const int indexB =
-        (indexA + 1) % size;
-
-    const float fraction =
-        readPosition - static_cast<float>(indexA);
-
-    return data[indexA]
-        + (data[indexB] - data[indexA]) * fraction;
+    return data[static_cast<size_t>(indexA)]
+        + (data[static_cast<size_t>(indexB)]
+           - data[static_cast<size_t>(indexA)]) * fraction;
 }
 
 void PitchCorrector::process(
@@ -279,14 +284,10 @@ void PitchCorrector::process(
     float flexTune,
     int mode)
 {
-    const int channels = juce::jmin(
-        buffer.getNumChannels(),
-        channelCount
-    );
-
+    const int channels = juce::jmin(buffer.getNumChannels(), channelCount);
     const int samples = buffer.getNumSamples();
 
-    if (channels <= 0 || samples <= 0)
+    if (channels <= 0 || samples <= 0 || delayBuffers.empty())
         return;
 
     amount = juce::jlimit(0.0f, 100.0f, amount);
@@ -294,35 +295,24 @@ void PitchCorrector::process(
     humanize = juce::jlimit(0.0f, 100.0f, humanize);
     flexTune = juce::jlimit(0.0f, 100.0f, flexTune);
 
-    const bool correctionActive =
-        enabled && amount > 0.01f;
-
+    const bool correctionActive = enabled && amount > 0.01f;
     const float amountNormalised = amount * 0.01f;
-
-    const float speedNormalised =
-        (retuneSpeed - 1.0f) / 99.0f;
+    const float speedNormalised = (retuneSpeed - 1.0f) / 99.0f;
 
     float timeConstant =
-        0.45f * (1.0f - speedNormalised)
-        + 0.008f;
+        0.45f * (1.0f - speedNormalised) + 0.008f;
 
     if (mode == 1)
-        timeConstant = 0.0025f
-            + (1.0f - speedNormalised) * 0.012f;
+        timeConstant = 0.0025f + (1.0f - speedNormalised) * 0.012f;
 
-    timeConstant *=
-        1.0f + humanize * 0.01f * 0.65f;
+    timeConstant *= 1.0f + humanize * 0.01f * 0.65f;
 
     const float smoothingCoefficient =
         1.0f - std::exp(
-            -1.0f /
-            static_cast<float>(
-                currentSampleRate * timeConstant
-            )
+            -1.0f / static_cast<float>(currentSampleRate * timeConstant)
         );
 
-    const int bufferSize =
-        static_cast<int>(delayBuffers[0].size());
+    const int bufferSize = static_cast<int>(delayBuffers[0].size());
 
     for (int sample = 0; sample < samples; ++sample)
     {
@@ -333,17 +323,45 @@ void PitchCorrector::process(
 
         monoSample /= static_cast<float>(channels);
 
-        analysisBuffer[analysisWritePosition] = monoSample;
+        analysisFirHistory[static_cast<size_t>(analysisFirWritePosition)] =
+            monoSample;
 
-        analysisWritePosition =
-            (analysisWritePosition + 1) % analysisSize;
+        analysisFirWritePosition =
+            (analysisFirWritePosition + 1) % analysisFirSize;
+
+        ++decimationCounter;
+
+        if (decimationCounter >= decimationFactor)
+        {
+            decimationCounter = 0;
+
+            float filteredSample = 0.0f;
+
+            for (int tap = 0; tap < analysisFirSize; ++tap)
+            {
+                int historyPosition =
+                    analysisFirWritePosition - 1 - tap;
+
+                while (historyPosition < 0)
+                    historyPosition += analysisFirSize;
+
+                filteredSample +=
+                    analysisFir[static_cast<size_t>(tap)]
+                    * analysisFirHistory[static_cast<size_t>(historyPosition)];
+            }
+
+            analysisBuffer[static_cast<size_t>(analysisWritePosition)] =
+                filteredSample;
+
+            analysisWritePosition =
+                (analysisWritePosition + 1) % analysisSize;
+        }
 
         ++samplesSinceAnalysis;
 
         if (samplesSinceAnalysis >= analysisHop)
         {
             samplesSinceAnalysis = 0;
-
             analysisReady = true;
 
             const float frequency = detectPitch();
@@ -354,23 +372,17 @@ void PitchCorrector::process(
 
                 if (correctionActive)
                 {
-                    const float midiNote =
-                        frequencyToMidi(frequency);
-
-                    const int targetNote =
-                        findTargetNote(midiNote, key, scale);
-
+                    const float midiNote = frequencyToMidi(frequency);
+                    const int targetNote = findTargetNote(midiNote, key, scale);
                     float difference =
                         static_cast<float>(targetNote) - midiNote;
 
-                    const float flexThreshold =
-                        flexTune * 0.005f;
+                    const float flexThreshold = flexTune * 0.005f;
 
                     if (std::abs(difference) < flexThreshold)
                         difference = 0.0f;
 
-                    targetSemitoneShift =
-                        difference * amountNormalised;
+                    targetSemitoneShift = difference * amountNormalised;
                 }
                 else
                 {
@@ -391,9 +403,7 @@ void PitchCorrector::process(
             * smoothingCoefficient;
 
         currentSemitoneShift = juce::jlimit(
-            -12.0f,
-            12.0f,
-            currentSemitoneShift
+            -12.0f, 12.0f, currentSemitoneShift
         );
 
         const float pitchRatio =
@@ -403,64 +413,44 @@ void PitchCorrector::process(
 
         for (int channel = 0; channel < channels; ++channel)
         {
-            auto& delayLine =
-                delayBuffers[static_cast<size_t>(channel)];
-
-            delayLine[writePosition] =
-                buffer.getSample(channel, sample);
+            delayBuffers[static_cast<size_t>(channel)]
+                [static_cast<size_t>(writePosition)] =
+                    buffer.getSample(channel, sample);
         }
 
-        float outputDelay = static_cast<float>(latencySamples);
+        const float neutralDelay = static_cast<float>(latencySamples);
 
-        if (correctionActive && std::abs(pitchRatio - 1.0f) > 0.001f)
+        // Keep the neutral path stable around zero correction. This avoids
+        // the old hard 0.1% ratio switch, which could click as tuning began.
+        if (correctionActive && std::abs(pitchRatio - 1.0f) > 0.00001f)
         {
             const float delayRange =
                 static_cast<float>(maximumDelay - minimumDelay);
 
-            const float phaseOffset =
-                pitchRatio > 1.0f
-                    ? pitchRatio - 1.0f
-                    : 1.0f - pitchRatio;
-
+            const float phaseOffset = std::abs(pitchRatio - 1.0f);
             pitchPhase += phaseOffset / delayRange;
 
             while (pitchPhase >= 1.0f)
                 pitchPhase -= 1.0f;
 
             const float phaseA = pitchPhase;
-
             float phaseB = phaseA + 0.5f;
 
             if (phaseB >= 1.0f)
                 phaseB -= 1.0f;
 
-            float delayA = 0.0f;
-            float delayB = 0.0f;
+            const float delayA =
+                pitchRatio > 1.0f
+                    ? static_cast<float>(maximumDelay) - phaseA * delayRange
+                    : static_cast<float>(minimumDelay) + phaseA * delayRange;
 
-            if (pitchRatio > 1.0f)
-            {
-                delayA =
-                    static_cast<float>(maximumDelay)
-                    - phaseA * delayRange;
-
-                delayB =
-                    static_cast<float>(maximumDelay)
-                    - phaseB * delayRange;
-            }
-            else
-            {
-                delayA =
-                    static_cast<float>(minimumDelay)
-                    + phaseA * delayRange;
-
-                delayB =
-                    static_cast<float>(minimumDelay)
-                    + phaseB * delayRange;
-            }
+            const float delayB =
+                pitchRatio > 1.0f
+                    ? static_cast<float>(maximumDelay) - phaseB * delayRange
+                    : static_cast<float>(minimumDelay) + phaseB * delayRange;
 
             const float weightA =
                 0.5f + 0.5f * std::cos(2.0f * pi * phaseA);
-
             const float weightB = 1.0f - weightA;
 
             for (int channel = 0; channel < channels; ++channel)
@@ -468,30 +458,24 @@ void PitchCorrector::process(
                 const auto& delayLine =
                     delayBuffers[static_cast<size_t>(channel)];
 
-                const float signalA =
-                    readDelayLine(delayLine, delayA);
+                const float shifted =
+                    readDelayLine(delayLine, delayA) * weightA
+                    + readDelayLine(delayLine, delayB) * weightB;
 
-                const float signalB =
-                    readDelayLine(delayLine, delayB);
-
-                const float output =
-                    signalA * weightA
-                    + signalB * weightB;
-
-                buffer.setSample(channel, sample, output);
+                buffer.setSample(channel, sample, shifted);
             }
         }
         else
         {
             for (int channel = 0; channel < channels; ++channel)
             {
-                const auto& delayLine =
-                    delayBuffers[static_cast<size_t>(channel)];
-
                 buffer.setSample(
                     channel,
                     sample,
-                    readDelayLine(delayLine, outputDelay)
+                    readDelayLine(
+                        delayBuffers[static_cast<size_t>(channel)],
+                        neutralDelay
+                    )
                 );
             }
         }

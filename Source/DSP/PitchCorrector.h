@@ -1,6 +1,7 @@
 #pragma once
 
 #include <JuceHeader.h>
+#include <array>
 #include <vector>
 
 class PitchCorrector
@@ -39,7 +40,19 @@ private:
 
     std::vector<std::vector<float>> delayBuffers;
 
+    // Pitch analysis runs at one quarter of the audio sample rate.
+    // A short low-pass FIR is applied before decimation to suppress
+    // harmonics folding into the pitch detector's analysis band.
+    static constexpr int analysisSize = 2048;
+    static constexpr int decimationFactor = 4;
+    static constexpr int analysisWindow = 512;
+    static constexpr int analysisHop = 256;
+    static constexpr int analysisFirSize = 15;
+
     std::vector<float> analysisBuffer;
+    std::array<float, analysisFirSize> analysisFirHistory {};
+    int analysisFirWritePosition = 0;
+    int decimationCounter = 0;
     int analysisWritePosition = 0;
     int samplesSinceAnalysis = 0;
 
