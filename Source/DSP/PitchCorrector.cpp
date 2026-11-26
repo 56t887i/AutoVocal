@@ -71,6 +71,8 @@ void PitchCorrector::reset()
     decimationCounter = 0;
     analysisWritePosition = 0;
     samplesSinceAnalysis = 0;
+    analysisSamplesWritten = 0;
+    voicedHoldSamples = 0;
 
     detectedFrequency = 0.0f;
     currentSemitoneShift = 0.0f;
@@ -355,43 +357,64 @@ void PitchCorrector::process(
 
             analysisWritePosition =
                 (analysisWritePosition + 1) % analysisSize;
-        }
 
-        ++samplesSinceAnalysis;
+            analysisSamplesWritten =
+                juce::jmin(analysisWindow, analysisSamplesWritten + 1);
 
-        if (samplesSinceAnalysis >= analysisHop)
-        {
-            samplesSinceAnalysis = 0;
-            analysisReady = true;
+            // Count the hop in decimated samples, not full-rate samples.
+            // The previous counter ran four times too quickly.
+            ++samplesSinceAnalysis;
 
-            const float frequency = detectPitch();
-
-            if (frequency > 0.0f)
+            if (samplesSinceAnalysis >= analysisHop)
             {
-                detectedFrequency = frequency;
+                samplesSinceAnalysis = 0;
+                analysisReady = analysisSamplesWritten >= analysisWindow;
 
-                if (correctionActive)
+                if (analysisReady)
                 {
-                    const float midiNote = frequencyToMidi(frequency);
-                    const int targetNote = findTargetNote(midiNote, key, scale);
-                    float difference =
-                        static_cast<float>(targetNote) - midiNote;
+                    const float frequency = detectPitch();
 
-                    const float flexThreshold = flexTune * 0.005f;
+                    if (frequency > 0.0f)
+                    {
+                        detectedFrequency = frequency;
+                        voicedHoldSamples = 0;
 
-                    if (std::abs(difference) < flexThreshold)
-                        difference = 0.0f;
+                        if (correctionActive)
+                        {
+                            const float midiNote = frequencyToMidi(frequency);
+                            const int targetNote = findTargetNote(midiNote, key, scale);
+                            float difference =
+                                static_cast<float>(targetNote) - midiNote;
 
-                    targetSemitoneShift = difference * amountNormalised;
+                            const float flexThreshold = flexTune * 0.005f;
+
+                            if (std::abs(difference) < flexThreshold)
+                                difference = 0.0f;
+
+                            targetSemitoneShift = difference * amountNormalised;
+                        }
+                        else
+                        {
+                            targetSemitoneShift = 0.0f;
+                        }
+                    }
+                    else
+                    {
+                        // Briefly keep the last stable note through consonants
+                        // and tiny gaps. Longer unvoiced sections release to
+                        // neutral instead of carrying a stale correction.
+                        voicedHoldSamples += analysisHop * decimationFactor;
+
+                        const int holdLimit =
+                            static_cast<int>(currentSampleRate * 0.060);
+
+                        if (voicedHoldSamples > holdLimit)
+                        {
+                            targetSemitoneShift = 0.0f;
+                            detectedFrequency = 0.0f;
+                        }
+                    }
                 }
-                else
-                {
-                    targetSemitoneShift = 0.0f;
-                }
-            }
-            else
-            {
-                targetSemitoneShift = 0.0f;
             }
         }
 

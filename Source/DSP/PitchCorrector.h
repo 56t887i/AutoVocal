@@ -55,6 +55,8 @@ private:
     int decimationCounter = 0;
     int analysisWritePosition = 0;
     int samplesSinceAnalysis = 0;
+    int analysisSamplesWritten = 0;
+    int voicedHoldSamples = 0;
 
     float detectedFrequency = 0.0f;
     float currentSemitoneShift = 0.0f;
