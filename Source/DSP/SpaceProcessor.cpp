@@ -12,6 +12,8 @@ void SpaceProcessor::prepare(
 
     delayBuffers.clear();
     delayPositions.clear();
+    preDelayBuffers.clear();
+    preDelayPositions.clear();
 
     const int channelCount = juce::jmax(1, channels);
 
@@ -25,6 +27,16 @@ void SpaceProcessor::prepare(
             0.0f
         );
     }
+
+    maxPreDelaySamples = static_cast<int>(sampleRate * 0.200);
+    preDelayBuffers.resize(static_cast<size_t>(channelCount));
+    preDelayPositions.assign(static_cast<size_t>(channelCount), 0);
+
+    for (auto& channelBuffer : preDelayBuffers)
+        channelBuffer.assign(static_cast<size_t>(maxPreDelaySamples + 1), 0.0f);
+
+    reverbBuffer.setSize(channelCount, 32768);
+    reverbBuffer.clear();
 
     juce::dsp::ProcessSpec spec;
     spec.sampleRate = sampleRate;
@@ -42,6 +54,12 @@ void SpaceProcessor::reset()
         std::fill(channelBuffer.begin(), channelBuffer.end(), 0.0f);
 
     std::fill(delayPositions.begin(), delayPositions.end(), 0);
+
+    for (auto& channelBuffer : preDelayBuffers)
+        std::fill(channelBuffer.begin(), channelBuffer.end(), 0.0f);
+
+    std::fill(preDelayPositions.begin(), preDelayPositions.end(), 0);
+    reverbBuffer.clear();
 
     reverb.reset();
 }
@@ -133,10 +151,19 @@ void SpaceProcessor::process(
     float delayFeedback,
     float delayMix)
 {
-    const int channels = buffer.getNumChannels();
+    const int channels = juce::jmin(
+        buffer.getNumChannels(),
+        static_cast<int>(preDelayBuffers.size())
+    );
+    const int samples = buffer.getNumSamples();
 
-    if (reverbEnabled && reverbMix > 0.001f)
+    // Process reverb on a separate wet-only path.
+    if (reverbEnabled && reverbMix > 0.001f
+        && channels > 0 && samples <= reverbBuffer.getNumSamples())
     {
+        for (int channel = 0; channel < channels; ++channel)
+            reverbBuffer.copyFrom(channel, 0, buffer, channel, 0, samples);
+
         juce::dsp::Reverb::Parameters parameters;
 
         if (reverbType == 0)
@@ -155,21 +182,54 @@ void SpaceProcessor::process(
             parameters.damping = 0.50f;
         }
 
-        parameters.wetLevel = juce::jlimit(0.0f, 1.0f, reverbMix);
-        parameters.dryLevel = 1.0f - parameters.wetLevel;
+        parameters.wetLevel = 1.0f;
+        parameters.dryLevel = 0.0f;
         parameters.width = 1.0f;
         parameters.freezeMode = 0.0f;
-
         reverb.setParameters(parameters);
 
-        juce::dsp::AudioBlock<float> block(buffer);
+        juce::dsp::AudioBlock<float> block(
+            reverbBuffer,
+            0,
+            static_cast<size_t>(samples)
+        );
         juce::dsp::ProcessContextReplacing<float> context(block);
-
         reverb.process(context);
-    }
 
-    // Predelay will be implemented as a separate stage later.
-    juce::ignoreUnused(preDelay, channels);
+        const int preDelaySamples = juce::jlimit(
+            0,
+            maxPreDelaySamples,
+            static_cast<int>(
+                sampleRate * juce::jlimit(0.0f, 200.0f, preDelay) * 0.001f
+            )
+        );
+        const float wetGain = juce::jlimit(0.0f, 1.0f, reverbMix);
+
+        for (int i = 0; i < samples; ++i)
+        {
+            for (int channel = 0; channel < channels; ++channel)
+            {
+                auto& line = preDelayBuffers[static_cast<size_t>(channel)];
+                int& position = preDelayPositions[static_cast<size_t>(channel)];
+
+                const float wetInput = reverbBuffer.getSample(channel, i);
+                float wetOutput = wetInput;
+
+                if (preDelaySamples > 0)
+                {
+                    int readPosition = position - preDelaySamples;
+                    if (readPosition < 0)
+                        readPosition += maxPreDelaySamples + 1;
+                    wetOutput = line[static_cast<size_t>(readPosition)];
+                }
+
+                line[static_cast<size_t>(position)] = wetInput;
+                position = (position + 1) % (maxPreDelaySamples + 1);
+
+                buffer.addSample(channel, i, wetOutput * wetGain);
+            }
+        }
+    }
 
     if (delayEnabled && delayMix > 0.001f)
     {

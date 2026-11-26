@@ -31,7 +31,13 @@ private:
     std::vector<std::vector<float>> delayBuffers;
     std::vector<int> delayPositions;
 
+    // Separate wet path: pre-delay must never shift the dry vocal.
+    juce::AudioBuffer<float> reverbBuffer;
+    std::vector<std::vector<float>> preDelayBuffers;
+    std::vector<int> preDelayPositions;
+
     int maxDelaySamples = 0;
+    int maxPreDelaySamples = 0;
 
     void processDelay(
         juce::AudioBuffer<float>& buffer,
