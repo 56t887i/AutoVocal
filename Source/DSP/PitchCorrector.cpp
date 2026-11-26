@@ -522,10 +522,12 @@ void PitchCorrector::process(
             -12.0f, 12.0f, currentSemitoneShift
         );
 
+        // Keep following the smoothed pitch shift while correction is
+        // being disabled or its amount is reduced. Forcing the ratio to 1.0
+        // immediately would bypass the gradual return and create a small
+        // discontinuity in the delay-head motion.
         const float pitchRatio =
-            correctionActive
-                ? std::pow(2.0f, currentSemitoneShift / 12.0f)
-                : 1.0f;
+            std::pow(2.0f, currentSemitoneShift / 12.0f);
 
         for (int channel = 0; channel < channels; ++channel)
         {
@@ -538,7 +540,7 @@ void PitchCorrector::process(
 
         // Keep the neutral path stable around zero correction. This avoids
         // the old hard 0.1% ratio switch, which could click as tuning began.
-        if (correctionActive && std::abs(pitchRatio - 1.0f) > 0.00001f)
+        if (std::abs(pitchRatio - 1.0f) > 0.00001f)
         {
             const float delayRange =
                 static_cast<float>(maximumDelay - minimumDelay);
