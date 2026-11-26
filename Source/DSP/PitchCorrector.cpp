@@ -128,7 +128,9 @@ float PitchCorrector::detectPitch()
 
     mean /= static_cast<double>(analysisWindow);
 
-    for (int lag = minimumLag; lag <= maximumLag; ++lag)
+    // Include every lag in the cumulative denominator, as required
+    // by YIN's cumulative-mean normalization.
+    for (int lag = 1; lag <= maximumLag; ++lag)
     {
         double sum = 0.0;
 
@@ -161,7 +163,7 @@ float PitchCorrector::detectPitch()
 
     double runningDifference = 0.0;
 
-    for (int lag = minimumLag; lag <= maximumLag; ++lag)
+    for (int lag = 1; lag <= maximumLag; ++lag)
     {
         runningDifference += difference[static_cast<size_t>(lag)];
 

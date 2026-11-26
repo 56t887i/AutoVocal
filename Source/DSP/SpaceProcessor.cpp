@@ -157,13 +157,11 @@ void SpaceProcessor::process(
     );
     const int samples = buffer.getNumSamples();
 
-    // Process reverb on a separate wet-only path.
+    // Process reverb on a separate wet-only path. Large host blocks
+    // are split into prepared chunks instead of silently bypassing reverb.
     if (reverbEnabled && reverbMix > 0.001f
-        && channels > 0 && samples <= reverbBuffer.getNumSamples())
+        && channels > 0 && reverbBuffer.getNumSamples() > 0)
     {
-        for (int channel = 0; channel < channels; ++channel)
-            reverbBuffer.copyFrom(channel, 0, buffer, channel, 0, samples);
-
         juce::dsp::Reverb::Parameters parameters;
 
         if (reverbType == 0)
@@ -188,14 +186,7 @@ void SpaceProcessor::process(
         parameters.freezeMode = 0.0f;
         reverb.setParameters(parameters);
 
-        juce::dsp::AudioBlock<float> block(
-            reverbBuffer,
-            0,
-            static_cast<size_t>(samples)
-        );
-        juce::dsp::ProcessContextReplacing<float> context(block);
-        reverb.process(context);
-
+        const int chunkCapacity = reverbBuffer.getNumSamples();
         const int preDelaySamples = juce::jlimit(
             0,
             maxPreDelaySamples,
@@ -205,28 +196,49 @@ void SpaceProcessor::process(
         );
         const float wetGain = juce::jlimit(0.0f, 1.0f, reverbMix);
 
-        for (int i = 0; i < samples; ++i)
+        for (int offset = 0; offset < samples; offset += chunkCapacity)
         {
+            const int chunkSamples =
+                juce::jmin(chunkCapacity, samples - offset);
+
             for (int channel = 0; channel < channels; ++channel)
+                reverbBuffer.copyFrom(
+                    channel, 0, buffer, channel, offset, chunkSamples
+                );
+
+            juce::dsp::AudioBlock<float> block(
+                reverbBuffer,
+                0,
+                static_cast<size_t>(chunkSamples)
+            );
+            juce::dsp::ProcessContextReplacing<float> context(block);
+            reverb.process(context);
+
+            for (int i = 0; i < chunkSamples; ++i)
             {
-                auto& line = preDelayBuffers[static_cast<size_t>(channel)];
-                int& position = preDelayPositions[static_cast<size_t>(channel)];
-
-                const float wetInput = reverbBuffer.getSample(channel, i);
-                float wetOutput = wetInput;
-
-                if (preDelaySamples > 0)
+                for (int channel = 0; channel < channels; ++channel)
                 {
-                    int readPosition = position - preDelaySamples;
-                    if (readPosition < 0)
-                        readPosition += maxPreDelaySamples + 1;
-                    wetOutput = line[static_cast<size_t>(readPosition)];
+                    auto& line = preDelayBuffers[static_cast<size_t>(channel)];
+                    int& position = preDelayPositions[static_cast<size_t>(channel)];
+
+                    const float wetInput = reverbBuffer.getSample(channel, i);
+                    float wetOutput = wetInput;
+
+                    if (preDelaySamples > 0)
+                    {
+                        int readPosition = position - preDelaySamples;
+                        if (readPosition < 0)
+                            readPosition += maxPreDelaySamples + 1;
+                        wetOutput = line[static_cast<size_t>(readPosition)];
+                    }
+
+                    line[static_cast<size_t>(position)] = wetInput;
+                    position = (position + 1) % (maxPreDelaySamples + 1);
+
+                    buffer.addSample(
+                        channel, offset + i, wetOutput * wetGain
+                    );
                 }
-
-                line[static_cast<size_t>(position)] = wetInput;
-                position = (position + 1) % (maxPreDelaySamples + 1);
-
-                buffer.addSample(channel, i, wetOutput * wetGain);
             }
         }
     }
