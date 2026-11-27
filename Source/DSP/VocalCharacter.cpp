@@ -1,6 +1,8 @@
 
 #include "VocalCharacter.h"
 
+#include <cmath>
+
 void VocalCharacter::prepare(
     double newSampleRate,
     int,
