@@ -287,7 +287,11 @@ void AutoVocalAudioProcessor::prepareToPlay(
     double sampleRate,
     int samplesPerBlock)
 {
-    currentSampleRate = sampleRate;
+    currentSampleRate = juce::jmax(1.0, sampleRate);
+    outputSafetyGain = 1.0f;
+    outputSafetyReleaseCoefficient = std::exp(
+        -1.0f / (0.080f * static_cast<float>(currentSampleRate))
+    );
 
     const int channels = juce::jmax(
         1,
@@ -338,6 +342,7 @@ void AutoVocalAudioProcessor::prepareToPlay(
     );
 
     dryBuffer.clear();
+    outputSafetyGain = 1.0f;
 
     noiseLearnStartRequested.store(false);
     noiseLearnStopRequested.store(false);
@@ -663,9 +668,14 @@ void AutoVocalAudioProcessor::processBlock(
 
     float outputPeak = 0.0f;
 
-    for (int channel = 0; channel < channels; ++channel)
+    // Linked, sample-by-sample protection. Unlike block-wide gain
+    // reduction, this behaves consistently at different host block
+    // sizes and releases smoothly after loud transients.
+    for (int i = 0; i < samples; ++i)
     {
-        for (int i = 0; i < samples; ++i)
+        float samplePeak = 0.0f;
+
+        for (int channel = 0; channel < channels; ++channel)
         {
             float value = buffer.getSample(channel, i);
 
@@ -675,21 +685,33 @@ void AutoVocalAudioProcessor::processBlock(
                 buffer.setSample(channel, i, value);
             }
 
-            outputPeak = juce::jmax(
-                outputPeak,
-                std::abs(value)
-            );
+            samplePeak = juce::jmax(samplePeak, std::abs(value));
         }
-    }
 
-    if (outputPeak > outputCeiling)
-    {
-        const float safetyGain =
-            outputCeiling / outputPeak;
+        const float targetGain =
+            samplePeak > outputCeiling
+                ? outputCeiling / samplePeak
+                : 1.0f;
 
-        buffer.applyGain(safetyGain);
+        // Instant attack protects the ceiling; recovery is smoothed.
+        if (targetGain < outputSafetyGain)
+            outputSafetyGain = targetGain;
+        else
+            outputSafetyGain = targetGain
+                + outputSafetyReleaseCoefficient
+                    * (outputSafetyGain - targetGain);
 
-        outputPeak = outputCeiling;
+        for (int channel = 0; channel < channels; ++channel)
+        {
+            float value =
+                buffer.getSample(channel, i) * outputSafetyGain;
+
+            // Absolute final guard against floating-point overshoot.
+            value = juce::jlimit(-outputCeiling, outputCeiling, value);
+            buffer.setSample(channel, i, value);
+
+            outputPeak = juce::jmax(outputPeak, std::abs(value));
+        }
     }
 
     outputLevel.store(outputPeak);

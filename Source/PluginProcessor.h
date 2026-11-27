@@ -80,6 +80,11 @@ private:
 
     double currentSampleRate = 44100.0;
 
+    // Stateful output safety stage: linked gain reduction with
+    // an 80 ms recovery time, independent of host block size.
+    float outputSafetyGain = 1.0f;
+    float outputSafetyReleaseCoefficient = 0.0f;
+
     // DSP modules
     NoiseReducer noiseReducer;
     PitchCorrector pitchCorrector;
