@@ -22,6 +22,7 @@ private:
     double sampleRate = 44100.0;
 
     juce::AudioBuffer<float> lowFrequencyState;
+    juce::AudioBuffer<float> previousSaturationInput;
 
     float processSample(
         float input,
@@ -29,6 +30,7 @@ private:
         float saturation,
         float warmth,
         float softClip,
-        float& lowState
+        float& lowState,
+        float& previousDrivenInput
     );
 };

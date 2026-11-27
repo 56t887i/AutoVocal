@@ -8,10 +8,10 @@ void VocalCharacter::prepare(
 {
     sampleRate = juce::jmax(1.0, newSampleRate);
 
-    lowFrequencyState.setSize(
-        juce::jmax(1, channels),
-        1
-    );
+    const int safeChannels = juce::jmax(1, channels);
+
+    lowFrequencyState.setSize(safeChannels, 1);
+    previousSaturationInput.setSize(safeChannels, 1);
 
     reset();
 }
@@ -19,6 +19,7 @@ void VocalCharacter::prepare(
 void VocalCharacter::reset()
 {
     lowFrequencyState.clear();
+    previousSaturationInput.clear();
 }
 
 float VocalCharacter::processSample(
@@ -27,7 +28,8 @@ float VocalCharacter::processSample(
     float saturation,
     float warmth,
     float softClip,
-    float& lowState)
+    float& lowState,
+    float& previousDrivenInput)
 {
     drive = juce::jlimit(0.0f, 1.0f, drive);
     saturation = juce::jlimit(0.0f, 1.0f, saturation);
@@ -48,43 +50,55 @@ float VocalCharacter::processSample(
     const float warmSignal =
         input + lowState * warmth * 0.12f;
 
-    // Drive and saturation work together.
-    // No large input gain is applied.
-    const float driveAmount =
-        drive * 2.5f + saturation * 1.5f;
+    // ADAA (antiderivative anti-aliasing) soft saturation.
+    // This substantially reduces the harsh fold-back harmonics that
+    // a direct tanh/rational waveshaper creates at high drive.
+    const float driveScale =
+        1.0f + drive * 5.0f + saturation * 8.0f + softClip * 3.0f;
 
     const float saturationAmount =
         juce::jlimit(
             0.0f,
             1.0f,
-            saturation + drive * 0.35f
+            saturation + drive * 0.35f + softClip * 0.35f
         );
 
-    // Smooth rational saturation curve.
-    // It does not create uncontrolled output gain.
-    const float saturated =
-        warmSignal /
-        (1.0f + driveAmount * std::abs(warmSignal));
+    const float drivenInput = warmSignal * driveScale;
+    const float previousDriven = previousDrivenInput;
 
-    float result = juce::jmap(
+    const auto logCosh = [](float value)
+    {
+        const float magnitude = std::abs(value);
+
+        return magnitude
+            + std::log1p(std::exp(-2.0f * magnitude))
+            - 0.69314718056f;
+    };
+
+    const float difference = drivenInput - previousDriven;
+    float saturated = 0.0f;
+
+    if (std::abs(difference) > 0.0001f)
+    {
+        // First-order ADAA: divided difference of log(cosh).
+        saturated =
+            (logCosh(drivenInput) - logCosh(previousDriven))
+            / (driveScale * difference);
+    }
+    else
+    {
+        const float midpoint = 0.5f * (drivenInput + previousDriven);
+        saturated = std::tanh(midpoint) / driveScale;
+    }
+
+    previousDrivenInput = drivenInput;
+
+    // Keep the clean component intact and blend in controlled harmonics.
+    const float result = juce::jmap(
         saturationAmount,
         warmSignal,
         saturated
     );
-
-    // Additional gentle soft clipping.
-    if (softClip > 0.001f)
-    {
-        const float clipped =
-            result /
-            (1.0f + softClip * 2.0f * std::abs(result));
-
-        result = juce::jmap(
-            softClip,
-            result,
-            clipped
-        );
-    }
 
     return result;
 }
@@ -115,6 +129,9 @@ void VocalCharacter::process(
         float lowState =
             lowFrequencyState.getSample(channel, 0);
 
+        float previousDrivenInput =
+            previousSaturationInput.getSample(channel, 0);
+
         for (int i = 0; i < samples; ++i)
         {
             const float dry = buffer.getSample(channel, i);
@@ -125,7 +142,8 @@ void VocalCharacter::process(
                 saturation,
                 warmth,
                 softClip,
-                lowState
+                lowState,
+                previousDrivenInput
             );
 
             buffer.setSample(
@@ -139,6 +157,12 @@ void VocalCharacter::process(
             channel,
             0,
             lowState
+        );
+
+        previousSaturationInput.setSample(
+            channel,
+            0,
+            previousDrivenInput
         );
     }
 }
