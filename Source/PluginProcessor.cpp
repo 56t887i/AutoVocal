@@ -440,6 +440,26 @@ void AutoVocalAudioProcessor::processBlock(
     // Input gain.
     buffer.applyGain(inputGain);
 
+    // Preserve the actual dry signal before any processing.
+    const bool canUseDryBuffer =
+        channels <= dryBuffer.getNumChannels()
+        && samples <= dryBuffer.getNumSamples();
+
+    if (canUseDryBuffer)
+    {
+        for (int channel = 0; channel < channels; ++channel)
+        {
+            dryBuffer.copyFrom(
+                channel,
+                0,
+                buffer,
+                channel,
+                0,
+                samples
+            );
+        }
+    }
+
     //========================================================
     // NOISE REDUCTION MODE
     //========================================================
@@ -535,26 +555,6 @@ void AutoVocalAudioProcessor::processBlock(
         getParameterValue("flexTune"),
         static_cast<int>(getParameterValue("tuneMode"))
     );
-
-    // Preserve the signal after pitch correction.
-    const bool canUseDryBuffer =
-        channels <= dryBuffer.getNumChannels()
-        && samples <= dryBuffer.getNumSamples();
-
-    if (canUseDryBuffer)
-    {
-        for (int channel = 0; channel < channels; ++channel)
-        {
-            dryBuffer.copyFrom(
-                channel,
-                0,
-                buffer,
-                channel,
-                0,
-                samples
-            );
-        }
-    }
 
     //========================================================
     // VOCAL CHARACTER
